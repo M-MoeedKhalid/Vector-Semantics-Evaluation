@@ -1,5 +1,6 @@
 from collections import defaultdict
-
+import networkx as nx
+from itertools import chain
 import gensim
 import pandas as pd
 from gensim.models import Word2Vec, TfidfModel
@@ -10,87 +11,60 @@ import pytrec_eval
 import json
 
 from sklearn.feature_extraction import text
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn import metrics
 
 from nltk.tokenize.treebank import TreebankWordDetokenizer
 from nltk.corpus import stopwords
 
+import random
+random.seed(0)
+import numpy as np
+np.random.seed(0)
 
-def readfile(filepath, indexes=None):
+
+def readfile(filepath, indexes=None, header=False):
+    g = nx.Graph()
     if not indexes:
         indexes = [0, 1, 2]
-    file1 = open(filepath)
-    count = 0
-    dictionary = defaultdict(dict)
+    with open(filepath) as file1:
+        if header: file1.readline()
+        while True:
+            line = file1.readline()
+            if not line: break
+            file_tokens = line.strip().split()
+            word1, word2, score = str(file_tokens[indexes[0]]), str(file_tokens[indexes[1]]), float(file_tokens[indexes[2]])
+            if score > 6:
+                g.add_edges_from([(word1, word2, {'weight': score})])
 
-    while True:
-        count += 1
-        line = file1.readline()
-        if not line:
-            break
-        file_tokens = line.strip().split()
-        dictionary[str(file_tokens[indexes[0]])][str(file_tokens[indexes[1]])] = file_tokens[indexes[2]]
+    top_sim = dict()
+    for word in g.nodes():
+        top_sim[word] = {x:1 for x in nx.node_connected_component(g, word) if x != word}
 
-    file1.close()
-    return dictionary
-
-
-def trainword2vec(category):
-    text = brown.sents(categories=category)
-    w2v = Word2Vec(text, window=5, min_count=1, size=100, iter=100)
-    return w2v
-
+    return top_sim
 
 def normalize_dict(rank_norm, min_val, max_val):
     delta = max_val - min_val
     return [dict(d, score=(d['score'] - min_val) / delta) for d in rank_norm]
 
-
-def getmapandndcg(ground_truth_model, w2v):
+def getmapandndcg(ground_truth_lists, model):
     # keys =
     map = 0
     ndcg = 0
     total = 0
     exists = 0
-    for key in list(ground_truth_model.keys()):
-        print(f"For word {key}:")
+    for key in list(ground_truth_lists.keys()):
+        #print(f"For word {key}:")
         sims = dict()
         try:
-            for sim in w2v.most_similar(key, topn=10):
-                sims[sim[0]] = round(sim[1] * 10, 2)
-
+            sims = model.sim_func(key)
             # sims = normalize_dict(sims,1,10)
-            ground_truth = ground_truth_model[key]
-            change = True
-
-            if ground_truth.__len__() < 10 and ground_truth.__len__() != 0:
-                while change:
-                    length = len(list(ground_truth.keys()))
-                    change = False
-                    for key in list(ground_truth.keys()):
-                        newvalues = ground_truth_model[key]
-                        if list(newvalues.keys()) not in list(ground_truth.keys()):
-                            change = True
-                            ground_truth.update(ground_truth_model[key])
-                    if len(ground_truth.keys()) == length:
-                        break
-            sorted_result = dict(sorted(ground_truth.items(), key=lambda x: x[1]))
-            ground_truth = {k: sorted_result[k] for k in list(sorted_result)[:10]}
-            for key, value in ground_truth.items():
-                ground_truth[key] = round(float(value))
-
-            qrel = {
-                'q1': ground_truth,
-            }
-
-            run = {
-                'q1': sims,
-            }
-            evaluator = pytrec_eval.RelevanceEvaluator(
-                qrel, {'map', 'ndcg'})
-            print(f"ground_truth is {ground_truth}")
-            print(f"prediction is {sims}")
-            print(json.dumps(evaluator.evaluate(run), indent=1))
+            qrel = {'q1': ground_truth_lists[key]}
+            run = {'q1': sims}
+            evaluator = pytrec_eval.RelevanceEvaluator(qrel, {'map', 'ndcg'})
+            #print(f"ground_truth is {ground_truth_lists[key]}")
+            #print(f"prediction is {sims}")
+            #print(json.dumps(evaluator.evaluate(run), indent=1))
             map = map + evaluator.evaluate(run)['q1']['map']
             ndcg = ndcg + evaluator.evaluate(run)['q1']['ndcg']
             exists = exists + 1
@@ -100,122 +74,65 @@ def getmapandndcg(ground_truth_model, w2v):
             #     result = evaluator.evaluate(run)
         except Exception as e:
             pass
-            print(repr(e))
+            #print(repr(e))
 
-    # print(f"Map is {map}")
-    # print(f"NDCG is {ndcg}")
-    return map, ndcg, total, exists
+    return map/exists, ndcg/exists, total, exists
 
+def trainword2vec(category, window=5, size=100):
+    text = brown.sents(categories=category)
+    w2v = Word2Vec(text, window=window, min_count=1, size=size, iter=100)
+    return w2v
 
-filepath = "data/WordSim-353/wordsim_similarity_goldstandard.txt"
-wordsim_353 = readfile(filepath)
+def w2v_func(self, word):
+    sims = {}
+    for sim in self.most_similar(word, topn=10):
+        sims[sim[0]] = sim[1]
+    return sims
 
-filepath = "data/SimLex-999/SimLex-999.txt"
-simlex_999 = readfile(filepath, [0, 1, 3])
+def w2v(gold_list):
+    Word2Vec.sim_func = w2v_func
+    for corpus in ['news', 'romance']:
+        for gold in gold_list.keys():
+            # print(f'Training on the *{corpus}* and evaluating based on *{gold}* ... ')
+            # print('corpus, gold, map,ndcg,total_zero,exist_count')
+            for w in range(2, 11, 1):
+                for d in chain(range(10, 100, 10), range(100, 600, 100)):
+                    w2v = trainword2vec(corpus, w, d)
+                    map, ndcg, total, exists = getmapandndcg(gold_list[gold], w2v)
+                    print(f'{corpus},{gold},{w},{d},{map},{ndcg},{total},{exists}')
 
-listofsents = list()
-listofwords = []
+import torch
+def traintfvec(corpus, vec):
+    tf = vec.fit_transform([' '.join(s) for s in brown.sents(categories=corpus)])
+    sim = 1 - metrics.pairwise_distances(tf.transpose(), metric='cosine', n_jobs=-1)
+    vec.scores, vec.idxes = torch.tensor(sim).topk(10, dim=1)
+    vec.word2idx = vec.vocabulary_
+    vec.idx2word = {v: k for k, v in vec.vocabulary_.items()}
 
-print("Training on the news corpus.. ")
-#################### W2V ####################
-w2v = trainword2vec('news')
-# ############################################
-print("Training done on the news corpus")
-map, ndcg, total, exists = getmapandndcg(wordsim_353, w2v)
-print("News and Wordsim")
-print(f'Returned values are {map} and {ndcg} on {total} values out of {exists} that exist ')
+def tfvec_func(self, word):
+    row = self.word2idx[word]
+    sims = {self.idx2word[x]: self.scores[row, i].item() for i, x in enumerate(self.idxes[row, :].tolist()) if word !=self.idx2word[x]}
+    return sims
 
-map, ndcg, total, exists = getmapandndcg(simlex_999, w2v)
-print("News and Simlex")
-print(f'Returned values are {map} and {ndcg} on {total} values out of {exists} that exist')
-
-print("Training on the romance corpus.. ")
-#################### W2V ####################
-w2v = trainword2vec('romance')
-# ############################################
-print("Training done on the romance corpus")
-print("Romance and Wordsim")
-map, ndcg, total, exists = getmapandndcg(wordsim_353, w2v)
-print(f'Returned values are {map} and {ndcg} on {total} values out of {exists} that exist')
-
-print("Romance and Simlex")
-map, ndcg, total, exists = getmapandndcg(simlex_999, w2v)
-print(f'Returned values are {map} and {ndcg} on {total} values out of {exists} that exist')
-
-
-# ################ Preprocessing Necessary for using tf-idf ######################
-
-
-# for sent in brown.sents(categories='news'):
-#     munged_sentence = ' '.join(sent).replace('``', '"').replace("''", '"').replace('`', "'")
-#     sentence = TreebankWordDetokenizer().detokenize(
-#         munged_sentence.split(), ).lower()
-#     splits = sentence.split()
-#     for split in splits:
-#         listofwords.append(split)
-#     listofsents.append(sentence)
-# print('preprocessing done')
-
-# ################ Simple dummy corpus ######################
+def tf_idf(gold_list):
+    for corpus in ['news', 'romance']:
+        CountVectorizer.sim_func = tfvec_func
+        TfidfVectorizer.sim_func = tfvec_func
+        for vec in [CountVectorizer(ngram_range=(1, 1)), TfidfVectorizer(use_idf=True, ngram_range=(1, 1), norm='l2')]:
+            traintfvec(corpus, vec)#everything needed is attached to the obj instance of vec :D
+            for gold in gold_list.keys():
+                map, ndcg, total, exists = getmapandndcg(gold_list[gold], vec)
+                print(f'{corpus},{gold},{vec},{map},{ndcg},{total},{exists}')
 
 
-corpus = [
-    'This is the first document.',
-    'This document is the second document.',
-    'And this is the third one.',
-    'Is this the first document?',
-]
+if __name__ == "__main__":
+    gold_list = dict()
 
-# ################TF-IDF using scikitlearn ######################
+    filepath = "data/WordSim-353/wordsim_similarity_goldstandard.txt"
+    gold_list['wordsim_353'] = readfile(filepath)
 
-# tfIdfVectorizer = TfidfVectorizer(use_idf=False, ngram_range=(1, 1), )
-# tfIdf = tfIdfVectorizer.fit_transform(corpus)
-# df = pd.DataFrame(tfIdf[0].T.toarray(), index=tfIdfVectorizer.get_feature_names(), columns=["TF-IDF"])
-# df = df.sort_values('TF-IDF', ascending=False)
-# print(df[:30])
-#
-# df = df.to_dict()
+    filepath = "data/SimLex-999/SimLex-999.txt"
+    gold_list['simlex_999'] = readfile(filepath, [0, 1, 3], header=True)
 
-# ################TF-IDF using NLTK ######################
-
-
-# from nltk.corpus import brown
-#
-# text = nltk.Text(brown.words(categories="news"))
-# print(text)
-# print()
-# print("Concordance:")
-# text.concordance("news")
-# print()
-# print("Distributionally similar words:")
-# text.similar("news")
-# print()
-# print("Collocations:")
-# text.collocations()
-# print()
-# # print("Automatically generated text:")
-# # text.generate()
-# # print()
-# print("Dispersion plot:")
-# text.dispersion_plot(["news", "report", "said", "announced"])
-# print()
-# print("Vocabulary plot:")
-# text.plot(50)
-# print()
-# print("Indexing:")
-# print("text[3]:", text[3])
-# print("text[3:5]:", text[3:5])
-# print("text.vocab()['news']:", text.vocab()["news"])
-
-
-# ################TF-IDF using gensim ######################
-
-# from gensim import corpora
-# from gensim.utils import simple_preprocess
-#
-#
-# doc_tokenized = [simple_preprocess(doc) for doc in listofsents]
-# dictionary = corpora.Dictionary()
-# BoW_corpus = [dictionary.doc2bow(doc, allow_update=True) for doc in doc_tokenized]
-# for doc in BoW_corpus:
-#     print([[dictionary[id], freq] for id, freq in doc])
+    #w2v(gold_list)
+    #tf_idf(gold_list)
